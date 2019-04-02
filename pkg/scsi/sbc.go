@@ -504,10 +504,14 @@ func SBCReadCapacity(host int, cmd *api.SCSICommand) api.SAMStat {
 	// data[1] = __cpu_to_be32(1U << bshift);
 	copy(cmd.InSDBBuffer.Buffer[4:], util.MarshalUint32(uint32(1<<bshift)))
 overflow:
-	cmd.InSDBBuffer.Resid = 8
+	if cmd.InSDBBuffer != nil {
+		cmd.InSDBBuffer.Resid = 0
+	}
 	return api.SAMStatGood
 sense:
-	cmd.InSDBBuffer.Resid = 0
+	if cmd.InSDBBuffer != nil {
+		cmd.InSDBBuffer.Resid = 0
+	}
 	BuildSenseData(cmd, key, asc)
 	return api.SAMStatCheckCondition
 }
@@ -649,7 +653,9 @@ func SBCGetLbaStatus(host int, cmd *api.SCSICommand) api.SAMStat {
 	}
 	return api.SAMStatGood
 sense:
-	cmd.InSDBBuffer.Resid = 0
+	if cmd.InSDBBuffer != nil {
+		cmd.InSDBBuffer.Resid = 0
+	}
 	BuildSenseData(cmd, key, asc)
 	return api.SAMStatCheckCondition
 }
