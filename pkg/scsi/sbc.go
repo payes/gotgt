@@ -504,9 +504,7 @@ func SBCReadCapacity(host int, cmd *api.SCSICommand) api.SAMStat {
 	// data[1] = __cpu_to_be32(1U << bshift);
 	copy(cmd.InSDBBuffer.Buffer[4:], util.MarshalUint32(uint32(1<<bshift)))
 overflow:
-	if cmd.InSDBBuffer != nil {
-		cmd.InSDBBuffer.Resid = 0
-	}
+	cmd.InSDBBuffer.Resid = 8
 	return api.SAMStatGood
 sense:
 	if cmd.InSDBBuffer != nil {
