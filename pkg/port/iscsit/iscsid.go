@@ -654,11 +654,13 @@ func (s *ISCSITargetDriver) scsiCommandHandler(conn *iscsiConnection) (err error
 	case OpSCSICmd:
 		log.Debugf("SCSI Command processing...")
 		if s.enableStats {
+			s.TargetStats.Lock()
 			if _, ok := s.TargetStats.SCSIIOCount[(int)(req.CDB[0])]; ok != false {
 				s.TargetStats.SCSIIOCount[(int)(req.CDB[0])] += 1
 			} else {
 				s.TargetStats.SCSIIOCount[(int)(req.CDB[0])] = 1
 			}
+			s.TargetStats.Unlock()
 		}
 		scmd := &api.SCSICommand{
 			ITNexusID:       conn.session.ITNexus.ID,
@@ -931,10 +933,19 @@ func (s *ISCSITargetDriver) iscsiExecTask(task *iscsiTask) error {
 }
 
 func (s *ISCSITargetDriver) Stats() scsi.Stats {
-	return s.TargetStats
+	s.TargetStats.RLock()
+	defer s.TargetStats.RUnlock()
+	stats := s.TargetStats
+	stats.SCSIIOCount = map[int]int64{}
+	for key, value := range s.TargetStats.SCSIIOCount {
+		stats.SCSIIOCount[key] = value
+	}
+	return stats
 }
 
 func (s *ISCSITargetDriver) UpdateStats(conn *iscsiConnection) {
+	s.TargetStats.Lock()
+	defer s.TargetStats.Unlock()
 	s.TargetStats.IsClientConnected = s.isClientConnected
 	switch api.SCSICommandType(conn.resp.SCSIOpCode) {
 	case api.READ_6, api.READ_10, api.READ_12, api.READ_16:

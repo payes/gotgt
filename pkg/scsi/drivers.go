@@ -19,6 +19,7 @@ package scsi
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/gostor/gotgt/pkg/config"
 )
@@ -34,6 +35,7 @@ type SCSITargetDriver interface {
 }
 
 type Stats struct {
+	sync.RWMutex
 	IsClientConnected bool
 	RevisionCounter   int64
 	ReplicaCounter    int64
