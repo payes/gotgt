@@ -27,6 +27,8 @@ import (
 
 const iSCSIDriverName = "iscsi"
 
+var QUEUE_DEPTH int = 32
+
 const (
 	IOSTATE_FREE = iota
 
