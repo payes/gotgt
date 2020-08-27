@@ -194,7 +194,7 @@ func (s *ISCSITargetDriver) Run() error {
 	s.mu.Lock()
 	s.l = l
 	s.mu.Unlock()
-	log.Infof("NEW iSCSI service listening on: %v", s.l.Addr())
+	log.Infof("iSCSI service listening on: %v", s.l.Addr())
 
 	s.setState(STATE_RUNNING)
 	for {
@@ -215,8 +215,8 @@ func (s *ISCSITargetDriver) Run() error {
 
 		iscsiConn := &iscsiConnection{
 			conn:       conn,
-			writer:     make(chan *ISCSICommand, QUEUE_DEPTH),
-			reader:     make(chan *ISCSICommand, QUEUE_DEPTH),
+			writer:     make(chan *iscsiTask, QUEUE_DEPTH),
+			reader:     make(chan *iscsiTask, QUEUE_DEPTH),
 			loginParam: &iscsiLoginParam{},
 		}
 
@@ -266,7 +266,7 @@ func (s *ISCSITargetDriver) Resize(size uint64) error {
 
 func (s *ISCSITargetDriver) handler(events byte, conn *iscsiConnection) {
 
-	go s.scsiCommandHandler(conn)
+	go s.luWorker(conn)
 	go s.rxHandler(conn)
 	s.txHandler(conn)
 	if conn.state == CONN_STATE_CLOSE {
@@ -277,100 +277,125 @@ func (s *ISCSITargetDriver) handler(events byte, conn *iscsiConnection) {
 
 func (s *ISCSITargetDriver) rxHandler(conn *iscsiConnection) {
 	for {
-		var (
-			hdigest uint = 0
-			ddigest uint = 0
-			final   bool = false
-			cmd     *ISCSICommand
-			buf     []byte = make([]byte, BHS_SIZE)
-			length  int
-			err     error
-		)
-		conn.readLock.Lock()
-		defer conn.readLock.Unlock()
-		if conn.state == CONN_STATE_SCSI {
-			hdigest = conn.loginParam.sessionParam[ISCSI_PARAM_HDRDGST_EN].Value & DIGEST_CRC32C
-			ddigest = conn.loginParam.sessionParam[ISCSI_PARAM_DATADGST_EN].Value & DIGEST_CRC32C
-		}
-		for {
-			switch conn.rxIOState {
-			case IOSTATE_RX_BHS:
-				log.Debug("rx handler: IOSTATE_RX_BHS")
-				length, err = conn.readData(buf)
-				if err != nil {
-					log.Error(err)
-					return
-				}
-				if length == 0 {
-					log.Warningf("set connection to close")
-					conn.state = CONN_STATE_CLOSE
-					return
-				}
-				cmd, err = parseHeader(buf)
-				if err != nil {
-					log.Error(err)
-					log.Warningf("set connection to close")
-					conn.state = CONN_STATE_CLOSE
-					return
-				}
-				conn.req = cmd
-				if length == BHS_SIZE && cmd.DataLen != 0 {
-					conn.rxIOState = IOSTATE_RX_INIT_AHS
-					break
-				}
-				if log.GetLevel() == log.DebugLevel {
-					log.Debugf("got command: \n%s", cmd.String())
-					log.Debugf("got buffer: %v", buf)
-				}
-				final = true
-			case IOSTATE_RX_INIT_AHS:
-				conn.rxIOState = IOSTATE_RX_DATA
-				break
-				if hdigest != 0 {
-					conn.rxIOState = IOSTATE_RX_INIT_HDIGEST
-				}
-			case IOSTATE_RX_DATA:
-				if ddigest != 0 {
-					conn.rxIOState = IOSTATE_RX_INIT_DDIGEST
-				}
-				if cmd == nil {
-					return
-				}
-				dl := ((cmd.DataLen + DataPadding - 1) / DataPadding) * DataPadding
-				cmd.RawData = make([]byte, int(dl))
-				length := 0
-				for length < dl {
-					l, err := conn.readData(cmd.RawData[length:])
-					if err != nil {
-						log.Error(err)
-						return
-					}
-					length += l
-				}
-				if length != dl {
-					log.Debugf("get length is %d, but expected %d", length, dl)
-					log.Warning("set connection to close")
-					conn.state = CONN_STATE_CLOSE
-					return
-				}
-				final = true
-			default:
-				log.Errorf("error %d %d\n", conn.state, conn.rxIOState)
-				return
-			}
-
-			if final {
-				break
-			}
+		if err := s.readReq(conn); err != nil {
+			conn.state = CONN_STATE_CLOSE
+			return
 		}
 		s.processReq(conn)
+		if conn.state == CONN_STATE_CLOSE {
+			return
+		}
+		conn.rxIOState = IOSTATE_RX_BHS
 	}
 }
+
+func (s *ISCSITargetDriver) readReq(conn *iscsiConnection) (err error) {
+	conn.readLock.Lock()
+	defer conn.readLock.Unlock()
+	var (
+		hdigest uint = 0
+		ddigest uint = 0
+		final   bool = false
+		cmd     *ISCSICommand
+		buf     []byte = make([]byte, BHS_SIZE)
+		length  int
+	)
+	if conn.state == CONN_STATE_SCSI {
+		hdigest = conn.loginParam.sessionParam[ISCSI_PARAM_HDRDGST_EN].Value & DIGEST_CRC32C
+		ddigest = conn.loginParam.sessionParam[ISCSI_PARAM_DATADGST_EN].Value & DIGEST_CRC32C
+	}
+	for {
+		switch conn.rxIOState {
+		case IOSTATE_RX_BHS:
+			log.Debug("rx handler: IOSTATE_RX_BHS")
+			length, err = conn.readData(buf)
+			if err != nil {
+				conn.state = CONN_STATE_CLOSE
+				log.Error(err)
+				return
+			}
+			if length == 0 {
+				log.Warningf("set connection to close")
+				conn.state = CONN_STATE_CLOSE
+				return
+			}
+			cmd, err = parseHeader(buf)
+			if err != nil {
+				log.Error(err)
+				log.Warningf("set connection to close")
+				conn.state = CONN_STATE_CLOSE
+				return
+			}
+			conn.req = cmd
+			if length == BHS_SIZE && cmd.DataLen != 0 {
+				conn.rxIOState = IOSTATE_RX_INIT_AHS
+				break
+			}
+			if log.GetLevel() == log.DebugLevel {
+				log.Debugf("got command: \n%s", cmd.String())
+				log.Debugf("got buffer: %v", buf)
+			}
+			final = true
+		case IOSTATE_RX_INIT_AHS:
+			conn.rxIOState = IOSTATE_RX_DATA
+			break
+			if hdigest != 0 {
+				conn.rxIOState = IOSTATE_RX_INIT_HDIGEST
+			}
+		case IOSTATE_RX_DATA:
+			if ddigest != 0 {
+				conn.rxIOState = IOSTATE_RX_INIT_DDIGEST
+			}
+			if cmd == nil {
+				return
+			}
+			dl := ((cmd.DataLen + DataPadding - 1) / DataPadding) * DataPadding
+			cmd.RawData = make([]byte, int(dl))
+			length := 0
+			for length < dl {
+				l, err := conn.readData(cmd.RawData[length:])
+				if err != nil {
+					log.Error(err)
+					return err
+				}
+				length += l
+			}
+			if length != dl {
+				log.Debugf("get length is %d, but expected %d", length, dl)
+				log.Warning("set connection to close")
+				conn.state = CONN_STATE_CLOSE
+				return
+			}
+			final = true
+		default:
+			log.Errorf("error %d %d\n", conn.state, conn.rxIOState)
+			return
+		}
+
+		if final {
+			break
+		}
+	}
+	return nil
+}
+
+var counter int
 
 func (s *ISCSITargetDriver) processReq(conn *iscsiConnection) {
 
 	if conn.state == CONN_STATE_SCSI {
-		conn.reader <- conn.req
+		req := conn.req
+		// TODO Convert this to be pushed to a channel where this could be saved,
+		// so that multiple connections on the same lun can add stats without a lock
+		if s.enableStats && req.OpCode == OpSCSICmd {
+			counter++
+			if _, ok := s.TargetStats.SCSIIOCount[(int)(req.CDB[0])]; ok != false {
+				s.TargetStats.SCSIIOCount[(int)(req.CDB[0])] += 1
+			} else {
+				s.TargetStats.SCSIIOCount[(int)(req.CDB[0])] = 1
+			}
+		}
+		s.scsiCommandHandler(conn)
 	} else {
 		conn.txIOState = IOSTATE_TX_BHS
 		conn.resp = &ISCSICommand{}
@@ -403,7 +428,6 @@ func (s *ISCSITargetDriver) processReq(conn *iscsiConnection) {
 }
 
 func (s *ISCSITargetDriver) iscsiExecLogin(conn *iscsiConnection) error {
-	log.Infof("PRINT 1")
 	var cmd = conn.req
 
 	conn.cid = cmd.ConnID
@@ -423,7 +447,7 @@ func (s *ISCSITargetDriver) iscsiExecLogin(conn *iscsiConnection) error {
 			return err
 		}
 		conn.state = CONN_STATE_LOGIN
-		return conn.buildRespPackage(OpLoginResp, nil)
+		return conn.QueueTaskToRespond(OpLoginResp, nil)
 	}
 
 	if _, err := conn.processLoginData(); err != nil {
@@ -443,9 +467,8 @@ func (s *ISCSITargetDriver) iscsiExecLogin(conn *iscsiConnection) error {
 	} else {
 		conn.state = CONN_STATE_LOGIN
 	}
-	log.Infof("PRINT 2")
 
-	return conn.buildRespPackage(OpLoginResp, nil)
+	return conn.QueueTaskToRespond(OpLoginResp, nil)
 }
 
 func iscsiExecLogout(conn *iscsiConnection) error {
@@ -463,6 +486,10 @@ func iscsiExecLogout(conn *iscsiConnection) error {
 		conn.resp.ExpCmdSN = conn.session.ExpCmdSN
 		conn.resp.MaxCmdSN = conn.session.ExpCmdSN + conn.session.MaxQueueCommand
 	}
+	task := &iscsiTask{
+		resp: conn.resp,
+	}
+	conn.writer <- task
 	return nil
 }
 
@@ -513,26 +540,33 @@ func (s *ISCSITargetDriver) iscsiExecText(conn *iscsiConnection) error {
 		MaxCmdSN: cmd.CmdSN,
 	}
 	conn.resp.RawData = util.MarshalKVText(result)
-	conn.writer <- conn.resp
+	task := &iscsiTask{
+		resp: conn.resp,
+	}
+	conn.writer <- task
 	return nil
 }
 
 func iscsiExecNoopOut(conn *iscsiConnection) error {
-	return conn.buildRespPackage(OpNoopIn, nil)
+	return conn.QueueTaskToRespond(OpNoopIn, nil)
 }
 
 func iscsiExecReject(conn *iscsiConnection) error {
-	return conn.buildRespPackage(OpReject, nil)
+	return conn.QueueTaskToRespond(OpReject, nil)
 }
 
-func iscsiExecR2T(conn *iscsiConnection) error {
-	return conn.buildRespPackage(OpReady, nil)
+func iscsiExecR2T(conn *iscsiConnection, task *iscsiTask) error {
+	return conn.QueueTaskToRespond(OpReady, task)
 }
 
 func (s *ISCSITargetDriver) txHandler(conn *iscsiConnection) {
 	for {
-		resp := <-conn.writer
-		log.Infof("PRINT 5")
+		task := <-conn.writer
+
+		resp := task.resp
+		if resp == nil {
+			resp, _ = conn.buildRespPackage(task)
+		}
 		var (
 			hdigest uint   = 0
 			ddigest uint   = 0
@@ -618,6 +652,7 @@ func (s *ISCSITargetDriver) txHandler(conn *iscsiConnection) {
 					conn.txIOState = IOSTATE_TX_BHS
 					goto SendRemainingData
 				} else {
+					conn.txIOState = IOSTATE_TX_BHS
 					break
 				}
 			}
@@ -641,180 +676,176 @@ func (s *ISCSITargetDriver) txHandler(conn *iscsiConnection) {
 			conn.txTask = nil
 		default:
 			log.Warnf("unexpected connection state: %v", conn.State())
-			conn.rxIOState = IOSTATE_RX_BHS
 		}
-		log.Infof("PRINT 6")
 	}
 }
 
-func (s *ISCSITargetDriver) scsiCommandHandler(conn *iscsiConnection) (err error) {
-	for {
-		req := <-conn.reader
-		switch req.OpCode {
-		case OpSCSICmd:
-			log.Debugf("SCSI Command processing...")
-			if s.enableStats {
-				if _, ok := s.TargetStats.SCSIIOCount[(int)(req.CDB[0])]; ok != false {
-					s.TargetStats.SCSIIOCount[(int)(req.CDB[0])] += 1
-				} else {
-					s.TargetStats.SCSIIOCount[(int)(req.CDB[0])] = 1
-				}
-			}
-			scmd := &api.SCSICommand{
-				ITNexusID:       conn.session.ITNexus.ID,
-				SCB:             req.CDB,
-				SCBLength:       len(req.CDB),
-				Lun:             req.LUN,
-				Tag:             uint64(req.TaskTag),
-				RelTargetPortID: conn.session.TPGT,
-			}
-			if req.Read {
-				if req.Write {
-					scmd.Direction = api.SCSIDataBidirection
-				} else {
-					scmd.Direction = api.SCSIDataRead
-				}
-			} else {
-				if req.Write {
-					scmd.Direction = api.SCSIDataWrite
-				}
-			}
-
-			task := &iscsiTask{conn: conn, cmd: req, tag: req.TaskTag, scmd: scmd}
-			task.scmd.OpCode = req.SCSIOpCode
-			if scmd.Direction == api.SCSIDataBidirection {
-				task.scmd.Result = api.SAMStatCheckCondition.Stat
-				scsi.BuildSenseData(task.scmd, scsi.ILLEGAL_REQUEST, scsi.NO_ADDITIONAL_SENSE)
-				conn.buildRespPackage(OpSCSIResp, task)
-				conn.rxTask = nil
-				break
-			}
-			if req.Write {
-				task.r2tCount = int(req.ExpectedDataLen) - req.DataLen
-				task.expectedDataLength = int64(req.ExpectedDataLen)
-				if !req.Final {
-					task.unsolCount = 1
-				}
-				// new buffer for the data out
-				if scmd.OutSDBBuffer == nil {
-					blen := int(req.ExpectedDataLen)
-					if blen == 0 {
-						blen = int(req.DataLen)
-					}
-					scmd.OutSDBBuffer = &api.SCSIDataBuffer{
-						Length: uint32(blen),
-						Buffer: make([]byte, blen),
-					}
-				}
-				log.Debugf("SCSI write, R2T count: %d, unsol Count: %d, offset: %d", task.r2tCount, task.unsolCount, task.offset)
-
-				if conn.session.SessionParam[ISCSI_PARAM_IMM_DATA_EN].Value == 1 {
-					copy(scmd.OutSDBBuffer.Buffer[task.offset:], req.RawData)
-					task.offset += req.DataLen
-				}
-				if task.r2tCount > 0 {
-					// prepare to receive more data
-					conn.session.ExpCmdSN += 1
-					task.state = taskPending
-					conn.session.PendingTasksMutex.Lock()
-					conn.session.PendingTasks.Push(task)
-					conn.session.PendingTasksMutex.Unlock()
-					conn.rxTask = task
-					if conn.session.SessionParam[ISCSI_PARAM_INITIAL_R2T_EN].Value == 1 {
-						iscsiExecR2T(conn)
-						break
-					} else {
-						log.Debugf("Not ready to exec the task")
-						return nil
-					}
-				}
-			} else if scmd.InSDBBuffer == nil {
-				scmd.InSDBBuffer = &api.SCSIDataBuffer{
-					Length: uint32(req.ExpectedDataLen),
-					Buffer: make([]byte, int(req.ExpectedDataLen)),
-				}
-			}
-			task.offset = 0
-			conn.rxTask = task
-			if err = s.iscsiTaskQueueHandler(task); err != nil {
-				if task.state == taskPending {
-					err = nil
-				}
-				return
-			} else {
-				if scmd.Direction == api.SCSIDataRead && scmd.SenseBuffer == nil && req.ExpectedDataLen != 0 {
-					conn.buildRespPackage(OpSCSIIn, task)
-				} else {
-					conn.buildRespPackage(OpSCSIResp, task)
-				}
-				conn.rxTask = nil
-			}
-		case OpSCSITaskReq:
-			// task management function
-			task := &iscsiTask{conn: conn, cmd: req, tag: req.TaskTag, scmd: nil}
-			conn.rxTask = task
-			if err = s.iscsiTaskQueueHandler(task); err != nil {
-				return
-			}
-		case OpSCSIOut:
-			log.Debugf("iSCSI Data-out processing...")
-			conn.session.PendingTasksMutex.RLock()
-			task := conn.session.PendingTasks.GetByTag(req.TaskTag)
-			conn.session.PendingTasksMutex.RUnlock()
-			if task == nil {
-				err = fmt.Errorf("Cannot find iSCSI task with tag[%v]", req.TaskTag)
-				log.Error(err)
-				return
-			}
-			copy(task.scmd.OutSDBBuffer.Buffer[task.offset:], req.RawData)
-			task.offset += req.DataLen
-			task.r2tCount = task.r2tCount - req.DataLen
-			log.Debugf("Final: %v", req.Final)
-			log.Debugf("r2tCount: %v", task.r2tCount)
-			if !req.Final {
-				log.Debugf("Not ready to exec the task")
-				return nil
-			} else if task.r2tCount > 0 {
-				// prepare to receive more data
-				if task.unsolCount == 0 {
-					task.r2tSN += 1
-				} else {
-					task.r2tSN = 0
-					task.unsolCount = 0
-				}
-				conn.rxTask = task
-				iscsiExecR2T(conn)
-				break
-			}
-			task.offset = 0
-			log.Debugf("Process the Data-out package")
-			conn.rxTask = task
-			if err = s.iscsiExecTask(task); err != nil {
-				return
-			} else {
-				conn.buildRespPackage(OpSCSIResp, task)
-				conn.rxTask = nil
-				conn.session.PendingTasksMutex.Lock()
-				conn.session.PendingTasks.RemoveByTag(req.TaskTag)
-				conn.session.PendingTasksMutex.Unlock()
-			}
-		case OpNoopOut:
-			iscsiExecNoopOut(conn)
-		case OpLogoutReq:
-			s.setClientStatus(false)
-			conn.txTask = &iscsiTask{conn: conn, cmd: req, tag: req.TaskTag}
-			conn.txIOState = IOSTATE_TX_BHS
-			iscsiExecLogout(conn)
-		case OpTextReq, OpSNACKReq:
-			err = fmt.Errorf("Cannot handle yet %s", opCodeMap[req.OpCode])
-			log.Error(err)
-			return
-		default:
-			err = fmt.Errorf("Unknown op %s", opCodeMap[req.OpCode])
-			log.Error(err)
-			return
+func (s *ISCSITargetDriver) processSCSICommand(conn *iscsiConnection, req *ISCSICommand) error {
+	defer func() {
+		if !conn.req.Immediate {
+			conn.session.ExpCmdSN++
+		}
+	}()
+	var err error
+	log.Debugf("SCSI Command processing...")
+	scmd := &api.SCSICommand{
+		ITNexusID:       conn.session.ITNexus.ID,
+		SCB:             req.CDB,
+		SCBLength:       len(req.CDB),
+		Lun:             req.LUN,
+		Tag:             uint64(req.TaskTag),
+		RelTargetPortID: conn.session.TPGT,
+	}
+	if req.Read {
+		if req.Write {
+			scmd.Direction = api.SCSIDataBidirection
+		} else {
+			scmd.Direction = api.SCSIDataRead
+		}
+	} else {
+		if req.Write {
+			scmd.Direction = api.SCSIDataWrite
 		}
 	}
+
+	task := &iscsiTask{conn: conn, cmd: req, tag: req.TaskTag, scmd: scmd}
+	task.scmd.OpCode = req.SCSIOpCode
+	if scmd.Direction == api.SCSIDataBidirection {
+		task.scmd.Result = api.SAMStatCheckCondition.Stat
+		scsi.BuildSenseData(task.scmd, scsi.ILLEGAL_REQUEST, scsi.NO_ADDITIONAL_SENSE)
+		conn.QueueTaskToRespond(OpSCSIResp, task)
+		return nil
+	}
+	if req.Write {
+		task.r2tCount = int(req.ExpectedDataLen) - req.DataLen
+		task.expectedDataLength = int64(req.ExpectedDataLen)
+		if !req.Final {
+			task.unsolCount = 1
+		}
+		// new buffer for the data out
+		// TODO: Remove, This nil check is not required
+		if scmd.OutSDBBuffer == nil {
+			blen := int(req.ExpectedDataLen)
+			if blen == 0 {
+				blen = int(req.DataLen)
+			}
+			scmd.OutSDBBuffer = &api.SCSIDataBuffer{
+				Length: uint32(blen),
+				Buffer: make([]byte, blen),
+			}
+		}
+
+		if conn.session.SessionParam[ISCSI_PARAM_IMM_DATA_EN].Value == 1 {
+			copy(scmd.OutSDBBuffer.Buffer[task.offset:], req.RawData)
+			task.offset += req.DataLen
+		}
+		if task.r2tCount > 0 {
+			// prepare to receive more data
+			//conn.session.ExpCmdSN += 1
+			task.state = taskPending
+			conn.session.PendingTasksMutex.Lock()
+			conn.session.PendingTasks.Push(task)
+			conn.session.PendingTasksMutex.Unlock()
+			if conn.session.SessionParam[ISCSI_PARAM_INITIAL_R2T_EN].Value == 1 {
+				iscsiExecR2T(conn, task)
+				return nil
+			} else {
+				log.Debugf("Not ready to exec the task")
+				return nil
+			}
+		}
+	} else if scmd.InSDBBuffer == nil {
+		scmd.InSDBBuffer = &api.SCSIDataBuffer{
+			Length: uint32(req.ExpectedDataLen),
+			Buffer: make([]byte, int(req.ExpectedDataLen)),
+		}
+	}
+	task.offset = 0
+	if err = s.iscsiTaskQueueHandler(task); err != nil {
+		if task.state == taskPending {
+			err = nil
+		}
+	}
+	return err
+}
+
+func (s *ISCSITargetDriver) processSCSIOut(conn *iscsiConnection, req *ISCSICommand) error {
+	var err error
+	//log.Infof("iSCSI Data-out processing...")
+	conn.session.PendingTasksMutex.RLock()
+	task := conn.session.PendingTasks.GetByTag(req.TaskTag)
+	conn.session.PendingTasksMutex.RUnlock()
+	if task == nil {
+		err = fmt.Errorf("Cannot find iSCSI task with tag[%v]", req.TaskTag)
+		log.Error(err)
+		return err
+	}
+	copy(task.scmd.OutSDBBuffer.Buffer[task.offset:], req.RawData)
+	task.offset += req.DataLen
+	task.r2tCount = task.r2tCount - req.DataLen
+	log.Debugf("Final: %v", req.Final)
+	log.Debugf("r2tCount: %v", task.r2tCount)
+	if !req.Final {
+		log.Debugf("Not ready to exec the task")
+		return nil
+	} else if task.r2tCount > 0 {
+		// prepare to receive more data
+		if task.unsolCount == 0 {
+			task.r2tSN += 1
+		} else {
+			task.r2tSN = 0
+			task.unsolCount = 0
+		}
+		iscsiExecR2T(conn, task)
+		return nil
+	}
+	task.offset = 0
+	conn.session.PendingTasksMutex.Lock()
+	conn.session.PendingTasks.RemoveByTag(req.TaskTag)
+	conn.session.PendingTasksMutex.Unlock()
+	conn.reader <- task
+	return nil
+}
+
+func (s *ISCSITargetDriver) luWorker(conn *iscsiConnection) {
+	var err error
+	for {
+		task := <-conn.reader
+		if err = s.iscsiExecTask(task); err != nil {
+			log.Error(err)
+		}
+	}
+}
+func (s *ISCSITargetDriver) scsiCommandHandler(conn *iscsiConnection) (err error) {
+	req := conn.req
+	switch req.OpCode {
+	case OpSCSICmd:
+		s.processSCSICommand(conn, req)
+	case OpSCSITaskReq:
+		// task management function
+		task := &iscsiTask{conn: conn, cmd: req, tag: req.TaskTag, scmd: nil}
+		if err = s.iscsiTaskQueueHandler(task); err != nil {
+			return
+		}
+	case OpSCSIOut:
+		s.processSCSIOut(conn, req)
+	case OpNoopOut:
+		iscsiExecNoopOut(conn)
+	case OpLogoutReq:
+		s.setClientStatus(false)
+		conn.txTask = &iscsiTask{conn: conn, cmd: req, tag: req.TaskTag}
+		conn.txIOState = IOSTATE_TX_BHS
+		iscsiExecLogout(conn)
+	case OpTextReq, OpSNACKReq:
+		err = fmt.Errorf("Cannot handle yet %s", opCodeMap[req.OpCode])
+		log.Error(err)
+		return
+	default:
+		err = fmt.Errorf("Unknown op %s", opCodeMap[req.OpCode])
+		log.Error(err)
+		return
+	}
+	return
 }
 
 func (s *ISCSITargetDriver) iscsiTaskQueueHandler(task *iscsiTask) error {
@@ -826,16 +857,12 @@ func (s *ISCSITargetDriver) iscsiTaskQueueHandler(task *iscsiTask) error {
 	}
 	cmdsn := cmd.CmdSN
 	log.Debugf("CmdSN of command is %d", cmdsn)
+
 	if cmdsn == sess.ExpCmdSN {
 	retry:
 		cmdsn += 1
-		sess.ExpCmdSN = cmdsn
-		log.Debugf("session's ExpCmdSN is %d", cmdsn)
-
 		log.Debugf("process task(%d)", task.cmd.CmdSN)
-		if err := s.iscsiExecTask(task); err != nil {
-			log.Error(err)
-		}
+		conn.reader <- task
 		sess.PendingTasksMutex.Lock()
 		if sess.PendingTasks.Len() == 0 {
 			sess.PendingTasksMutex.Unlock()
@@ -866,7 +893,6 @@ func (s *ISCSITargetDriver) iscsiTaskQueueHandler(task *iscsiTask) error {
 		return fmt.Errorf("pending")
 	}
 
-	return nil
 }
 
 func (s *ISCSITargetDriver) iscsiExecTask(task *iscsiTask) error {
@@ -875,11 +901,10 @@ func (s *ISCSITargetDriver) iscsiExecTask(task *iscsiTask) error {
 	case OpSCSICmd, OpSCSIOut:
 		task.state = taskSCSI
 		// add scsi target process queue
-		err := s.SCSI.AddCommandQueue(task.conn.session.Target.SCSITarget.TID, task.scmd)
+		err := s.SCSI.ExecuteCommand(task.conn.session.Target.SCSITarget.TID, task.scmd)
 		if err != nil {
 			task.state = 0
 		}
-		return err
 	case OpLogoutReq:
 
 	case OpNoopOut:
@@ -901,8 +926,7 @@ func (s *ISCSITargetDriver) iscsiExecTask(task *iscsiTask) error {
 				}
 				stask.conn = task.conn
 				log.Debugf("stask.conn: %#v", stask.conn)
-				stask.conn.buildRespPackage(OpSCSIResp, stask)
-				stask.conn.rxTask = nil
+				stask.conn.QueueTaskToRespond(OpSCSIResp, stask)
 				task.result = ISCSI_TMF_RSP_COMPLETE
 			}
 		case ISCSI_TM_FUNC_ABORT_TASK_SET:
@@ -917,7 +941,12 @@ func (s *ISCSITargetDriver) iscsiExecTask(task *iscsiTask) error {
 			task.result = ISCSI_TMF_RSP_REJECTED
 		}
 		// return response to initiator
-		return task.conn.buildRespPackage(OpSCSITaskResp, task)
+		return task.conn.QueueTaskToRespond(OpSCSITaskResp, task)
+	}
+	if task.scmd.Direction == api.SCSIDataRead && task.scmd.SenseBuffer == nil && task.cmd.ExpectedDataLen != 0 {
+		task.conn.QueueTaskToRespond(OpSCSIIn, task)
+	} else {
+		task.conn.QueueTaskToRespond(OpSCSIResp, task)
 	}
 	return nil
 }

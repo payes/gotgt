@@ -67,7 +67,7 @@ func (s *SCSITargetService) Resize(size uint64) error {
 	return nil
 }
 
-func (s *SCSITargetService) AddCommandQueue(tid int, scmd *api.SCSICommand) error {
+func (s *SCSITargetService) ExecuteCommand(tid int, scmd *api.SCSICommand) error {
 	var (
 		target *api.SCSITarget
 		itn    *api.ITNexus
@@ -109,9 +109,9 @@ func (s *SCSITargetService) AddCommandQueue(tid int, scmd *api.SCSICommand) erro
 
 	result := scmd.Device.PerformCommand(tid, scmd)
 	if result != api.SAMStatGood {
-		scmd.Result = result.Stat
 		log.Warnf("opcode: %xh err: %v", scmd.OpCode, result.Err)
 	}
+	scmd.Result = result.Stat
 	return nil
 }
 

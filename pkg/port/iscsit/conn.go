@@ -24,7 +24,6 @@ import (
 
 	"github.com/gostor/gotgt/pkg/api"
 	"github.com/gostor/gotgt/pkg/util"
-	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -62,8 +61,8 @@ type iscsiConnection struct {
 	txIOState int
 	refcount  int
 	conn      net.Conn
-	writer    chan *ISCSICommand
-	reader    chan *ISCSICommand
+	writer    chan *iscsiTask
+	reader    chan *iscsiTask
 
 	rxBuffer []byte
 	txBuffer []byte
@@ -113,7 +112,9 @@ type iscsiTask struct {
 	unsolCount int
 	expR2TSN   int
 
-	r2tSN uint32
+	r2tSN      uint32
+	respOpCode OpCode
+	resp       *ISCSICommand
 }
 
 func (c *iscsiConnection) init() {
@@ -131,6 +132,7 @@ func (c *iscsiConnection) init() {
 }
 
 func (c *iscsiConnection) readData(buf []byte) (int, error) {
+	//TODO Handle different error codes
 	length, err := io.ReadFull(c.conn, buf)
 	if err != nil {
 		return -1, err
@@ -151,14 +153,19 @@ func (conn *iscsiConnection) ReInstatement(newConn *iscsiConnection) {
 	conn.conn = newConn.conn
 }
 
-func (conn *iscsiConnection) buildRespPackage(oc OpCode, task *iscsiTask) error {
-	var req *ISCSICommand
+func (conn *iscsiConnection) QueueTaskToRespond(oc OpCode, task *iscsiTask) error {
 	if task == nil {
-		req = conn.req
-	} else {
-
-		req = task.cmd
+		task = &iscsiTask{}
+		task.cmd = conn.req
 	}
+	task.respOpCode = oc
+	conn.writer <- task
+	return nil
+}
+
+func (conn *iscsiConnection) buildRespPackage(task *iscsiTask) (*ISCSICommand, error) {
+	req := task.cmd
+	oc := task.respOpCode
 	resp := &ISCSICommand{
 		StartTime:       req.StartTime,
 		StatSN:          req.ExpStatSN,
@@ -184,7 +191,7 @@ func (conn *iscsiConnection) buildRespPackage(oc OpCode, task *iscsiTask) error 
 		resp.SCSIOpCode = req.SCSIOpCode
 		resp.Immediate = true
 		resp.Final = true
-		resp.SCSIResponse = 0x00
+		resp.SCSIResponse = task.scmd.Result
 		resp.HasStatus = true
 		scmd := task.scmd
 		resp.Status = scmd.Result
@@ -225,7 +232,7 @@ func (conn *iscsiConnection) buildRespPackage(oc OpCode, task *iscsiTask) error 
 		if req.CSG != SecurityNegotiation {
 			negoKeys, err := conn.processLoginData()
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if !conn.loginParam.keyDeclared {
 				negoKeys = loginKVDeclare(conn, negoKeys)
@@ -234,10 +241,7 @@ func (conn *iscsiConnection) buildRespPackage(oc OpCode, task *iscsiTask) error 
 			resp.RawData = util.MarshalKVText(negoKeys)
 		}
 	}
-	log.Infof("PRINT 3")
-
-	conn.writer <- resp
-	return nil
+	return resp, nil
 }
 
 func (conn *iscsiConnection) State() string {
