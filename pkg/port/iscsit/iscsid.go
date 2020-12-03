@@ -49,7 +49,6 @@ type ISCSITargetDriver struct {
 	statsEnq          chan bool
 	isClientConnected bool
 	statsEnqRes       chan scsi.Stats
-	SCSIIOCount       map[int]int64
 	listen            net.Listener
 	clusterIP         string
 	state             uint8
@@ -104,7 +103,6 @@ func NewISCSITargetDriver(base *scsi.SCSITargetService) (scsi.SCSITargetDriver, 
 		feed:         make(chan Msg, 10000),
 		statsEnq:     make(chan bool, 1),
 		statsEnqRes:  make(chan scsi.Stats, 1),
-		SCSIIOCount:  map[int]int64{},
 		state:        STATE_INIT,
 		lock:         &sync.RWMutex{},
 		TSIHPool:     map[uint16]bool{0: true, 65535: true},
@@ -139,7 +137,6 @@ func (s *ISCSITargetDriver) Stats() scsi.Stats {
 
 	s.statsEnq <- true
 	stats := <-s.statsEnqRes
-	stats.SCSIIOCount = s.SCSIIOCount
 	return stats
 }
 
@@ -588,6 +585,7 @@ func (s *ISCSITargetDriver) StatsFeed() {
 		TotalWriteTime       int64
 		TotalWriteBlockCount int64
 	)
+	SCSIIOCount := map[int]int64{}
 
 	for {
 		select {
@@ -606,8 +604,13 @@ func (s *ISCSITargetDriver) StatsFeed() {
 				TotalWriteBlockCount += msg.BlockCount
 				break
 			}
+			if _, ok := SCSIIOCount[(int)(msg.OpCode)]; ok != false {
+				SCSIIOCount[(int)(msg.OpCode)] += 1
+			} else {
+				SCSIIOCount[(int)(msg.OpCode)] = 1
+			}
 		case <-s.statsEnq:
-			s.statsEnqRes <- scsi.Stats{
+			stats := scsi.Stats{
 				IsClientConnected:   s.IsClientConnected(),
 				ReadIOPS:            ReadIOPS,
 				TotalReadBlockCount: TotalReadBlockCount,
@@ -617,6 +620,10 @@ func (s *ISCSITargetDriver) StatsFeed() {
 				TotalWriteBlockCount: TotalWriteBlockCount,
 				TotalWriteTime:       TotalWriteTime,
 			}
+			for key, value := range SCSIIOCount {
+				stats.SCSIIOCount[key] = value
+			}
+			s.statsEnqRes <- stats
 		}
 	}
 }
@@ -755,11 +762,6 @@ func (s *ISCSITargetDriver) scsiCommandHandler(conn *iscsiConnection) (err error
 	switch req.OpCode {
 	case OpSCSICmd:
 		log.Debugf("SCSI Command processing...")
-		if _, ok := s.SCSIIOCount[(int)(req.CDB[0])]; ok != false {
-			s.SCSIIOCount[(int)(req.CDB[0])] += 1
-		} else {
-			s.SCSIIOCount[(int)(req.CDB[0])] = 1
-		}
 		scmd := &api.SCSICommand{
 			ITNexusID:       conn.session.ITNexus.ID,
 			SCB:             req.CDB,
