@@ -53,13 +53,16 @@ type ISCSITargetDriver struct {
 	iSCSITargets      map[string]*ISCSITarget
 	TSIHPool          map[uint16]bool
 	TSIHPoolMutex     sync.Mutex
+	stopFeed          chan bool
+	feed              chan Msg
+	statsEnq          chan bool
+	statsEnqRes       chan scsi.Stats
 	isClientConnected bool
 	enableStats       bool
 	mu                *sync.RWMutex
 	l                 net.Listener
 	state             uint8
 	OpCode            int
-	TargetStats       scsi.Stats
 	clusterIP         string
 }
 
@@ -72,13 +75,16 @@ func NewISCSITargetDriver(base *scsi.SCSITargetService) (scsi.SCSITargetDriver, 
 		Name:         iSCSIDriverName,
 		iSCSITargets: map[string]*ISCSITarget{},
 		SCSI:         base,
+		stopFeed:     make(chan bool, 1),
+		feed:         make(chan Msg, 10000),
+		statsEnq:     make(chan bool, 1),
+		statsEnqRes:  make(chan scsi.Stats, 1),
 		TSIHPool:     map[uint16]bool{0: true, 65535: true},
 		mu:           &sync.RWMutex{},
 	}
 
 	if EnableStats {
 		driver.enableStats = true
-		driver.TargetStats.SCSIIOCount = map[int]int64{}
 	}
 	return driver, nil
 }
@@ -196,7 +202,11 @@ func (s *ISCSITargetDriver) Run() error {
 	s.mu.Unlock()
 	log.Infof("iSCSI service listening on: %v", s.l.Addr())
 
+	defer func() {
+		s.stopFeed <- true
+	}()
 	s.setState(STATE_RUNNING)
+	go s.StatsFeed()
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -522,6 +532,65 @@ func iscsiExecR2T(conn *iscsiConnection) error {
 	return conn.buildRespPackage(OpReady, nil)
 }
 
+type Msg struct {
+	ConnNum     int
+	OpCode      int
+	BlockCount  int64
+	ElapsedTime time.Duration
+}
+
+func (s *ISCSITargetDriver) StatsFeed() {
+	var (
+		ReadIOPS            int64
+		TotalReadTime       int64
+		TotalReadBlockCount int64
+
+		WriteIOPS            int64
+		TotalWriteTime       int64
+		TotalWriteBlockCount int64
+	)
+	SCSIIOCount := map[int]int64{}
+	for {
+		select {
+		case <-s.stopFeed:
+			return
+		case msg := <-s.feed:
+			switch api.SCSICommandType(msg.OpCode) {
+			case api.READ_6, api.READ_10, api.READ_12, api.READ_16:
+				ReadIOPS += 1
+				TotalReadTime += int64(msg.ElapsedTime)
+				TotalReadBlockCount += msg.BlockCount
+				break
+			case api.WRITE_6, api.WRITE_10, api.WRITE_12, api.WRITE_16:
+				WriteIOPS += 1
+				TotalWriteTime += int64(msg.ElapsedTime)
+				TotalWriteBlockCount += msg.BlockCount
+				break
+			}
+			if _, ok := SCSIIOCount[(int)(msg.OpCode)]; ok != false {
+				SCSIIOCount[(int)(msg.OpCode)] += 1
+			} else {
+				SCSIIOCount[(int)(msg.OpCode)] = 1
+			}
+		case <-s.statsEnq:
+			stats := scsi.Stats{
+				IsClientConnected:   s.isInitiatorConnected(),
+				ReadIOPS:            ReadIOPS,
+				TotalReadBlockCount: TotalReadBlockCount,
+				TotalReadTime:       TotalReadTime,
+
+				WriteIOPS:            WriteIOPS,
+				TotalWriteBlockCount: TotalWriteBlockCount,
+				TotalWriteTime:       TotalWriteTime,
+			}
+			for key, value := range SCSIIOCount {
+				stats.SCSIIOCount[key] = value
+			}
+			s.statsEnqRes <- stats
+		}
+	}
+}
+
 func (s *ISCSITargetDriver) txHandler(conn *iscsiConnection) {
 	var (
 		hdigest uint   = 0
@@ -529,6 +598,7 @@ func (s *ISCSITargetDriver) txHandler(conn *iscsiConnection) {
 		offset  uint32 = 0
 		final   bool   = false
 		count   uint32 = 0
+		msg     Msg
 	)
 	if conn.state == CONN_STATE_SCSI {
 		hdigest = conn.loginParam.sessionParam[ISCSI_PARAM_HDRDGST_EN].Value & DIGEST_CRC32C
@@ -549,7 +619,11 @@ func (s *ISCSITargetDriver) txHandler(conn *iscsiConnection) {
 
 	if s.enableStats {
 		if resp.OpCode == OpSCSIResp || resp.OpCode == OpSCSIIn {
-			s.UpdateStats(conn)
+			msg.ConnNum = conn.ConnNum
+			msg.OpCode = int(resp.SCSIOpCode)
+			msg.ElapsedTime = time.Since(resp.StartTime)
+			msg.BlockCount = int64(resp.ExpectedDataLen)
+			s.feed <- msg
 		}
 	}
 
@@ -653,13 +727,6 @@ func (s *ISCSITargetDriver) scsiCommandHandler(conn *iscsiConnection) (err error
 	switch req.OpCode {
 	case OpSCSICmd:
 		log.Debugf("SCSI Command processing...")
-		if s.enableStats {
-			if _, ok := s.TargetStats.SCSIIOCount[(int)(req.CDB[0])]; ok != false {
-				s.TargetStats.SCSIIOCount[(int)(req.CDB[0])] += 1
-			} else {
-				s.TargetStats.SCSIIOCount[(int)(req.CDB[0])] = 1
-			}
-		}
 		scmd := &api.SCSICommand{
 			ITNexusID:       conn.session.ITNexus.ID,
 			SCB:             req.CDB,
@@ -931,21 +998,7 @@ func (s *ISCSITargetDriver) iscsiExecTask(task *iscsiTask) error {
 }
 
 func (s *ISCSITargetDriver) Stats() scsi.Stats {
-	return s.TargetStats
-}
-
-func (s *ISCSITargetDriver) UpdateStats(conn *iscsiConnection) {
-	s.TargetStats.IsClientConnected = s.isClientConnected
-	switch api.SCSICommandType(conn.resp.SCSIOpCode) {
-	case api.READ_6, api.READ_10, api.READ_12, api.READ_16:
-		s.TargetStats.ReadIOPS += 1
-		s.TargetStats.TotalReadTime += int64(time.Since(conn.resp.StartTime))
-		s.TargetStats.TotalReadBlockCount += int64(conn.resp.ExpectedDataLen)
-		break
-	case api.WRITE_6, api.WRITE_10, api.WRITE_12, api.WRITE_16:
-		s.TargetStats.WriteIOPS += 1
-		s.TargetStats.TotalWriteTime += int64(time.Since(conn.resp.StartTime))
-		s.TargetStats.TotalWriteBlockCount += int64(conn.resp.ExpectedDataLen)
-		break
-	}
+	s.statsEnq <- true
+	stats := <-s.statsEnqRes
+	return stats
 }
